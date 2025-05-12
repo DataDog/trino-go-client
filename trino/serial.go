@@ -15,8 +15,10 @@
 package trino
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -99,7 +101,7 @@ func Timestamp(year int,
 func Serial(v interface{}) (string, error) {
 	switch x := v.(type) {
 	case nil:
-		return "", UnsupportedArgError{"<nil>"}
+		return "NULL", nil
 
 	// numbers convertible to int
 	case int8:
@@ -147,9 +149,11 @@ func Serial(v interface{}) (string, error) {
 	case string:
 		return "'" + strings.Replace(x, "'", "''", -1) + "'", nil
 
-		// TODO - []byte should probably be matched to 'VARBINARY' in trino
 	case []byte:
-		return "", UnsupportedArgError{"[]byte"}
+		if x == nil {
+			return "NULL", nil
+		}
+		return "X'" + hex.EncodeToString(x) + "'", nil
 
 	case trinoDate:
 		return fmt.Sprintf("DATE '%04d-%02d-%02d'", x.year, x.month, x.day), nil
@@ -163,7 +167,7 @@ func Serial(v interface{}) (string, error) {
 		return "TIMESTAMP " + time.Time(x).Format("'2006-01-02 15:04:05.999999999 Z07:00'"), nil
 
 	case time.Duration:
-		return "", UnsupportedArgError{"time.Duration"}
+		return serialDuration(x)
 
 		// TODO - json.RawMesssage should probably be matched to 'JSON' in Trino
 	case json.RawMessage:
@@ -207,4 +211,52 @@ func serialSlice(v []interface{}) (string, error) {
 	}
 
 	return "ARRAY[" + strings.Join(ss, ", ") + "]", nil
+}
+
+const (
+	// For seconds with milliseconds there is a maximum length of 10 digits
+	// or 11 characters with the dot and 12 characters with the minus sign and dot
+	maxIntervalStrLenWithDot = 11 // 123456789.1 and 12345678.91 are valid
+)
+
+func serialDuration(dur time.Duration) (string, error) {
+	switch {
+	case dur%time.Hour == 0:
+		return serialHoursInterval(dur), nil
+	case dur%time.Minute == 0:
+		return serialMinutesInterval(dur), nil
+	case dur%time.Second == 0:
+		return serialSecondsInterval(dur)
+	case dur%time.Millisecond == 0:
+		return serialMillisecondsInterval(dur)
+	default:
+		return "", fmt.Errorf("trino: duration %v is not a multiple of hours, minutes, seconds or milliseconds", dur)
+	}
+}
+
+func serialHoursInterval(dur time.Duration) string {
+	return "INTERVAL '" + strconv.Itoa(int(dur/time.Hour)) + "' HOUR"
+}
+
+func serialMinutesInterval(dur time.Duration) string {
+	return "INTERVAL '" + strconv.Itoa(int(dur/time.Minute)) + "' MINUTE"
+}
+
+func serialSecondsInterval(dur time.Duration) (string, error) {
+	seconds := int64(dur / time.Second)
+	if seconds <= math.MinInt32 || seconds > math.MaxInt32 {
+		return "", fmt.Errorf("trino: duration %v is out of range for interval of seconds type", dur)
+	}
+	return "INTERVAL '" + strconv.FormatInt(seconds, 10) + "' SECOND", nil
+}
+
+func serialMillisecondsInterval(dur time.Duration) (string, error) {
+	seconds := int64(dur / time.Second)
+	millisInSecond := dur.Abs().Milliseconds() % 1000
+	intervalNr := strings.TrimRight(fmt.Sprintf("%d.%03d", seconds, millisInSecond), "0")
+	if seconds > 0 && len(intervalNr) > maxIntervalStrLenWithDot ||
+		seconds < 0 && len(intervalNr) > maxIntervalStrLenWithDot+1 { // +1 for the minus sign
+		return "", fmt.Errorf("trino: duration %v is out of range for interval of seconds with millis type", dur)
+	}
+	return "INTERVAL '" + intervalNr + "' SECOND", nil
 }

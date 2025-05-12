@@ -1,8 +1,10 @@
 name: ci
 
 on:
-  - push
-  - pull_request
+  push:
+    branches:
+      - master
+  pull_request:
 
 jobs:
   build:
@@ -10,11 +12,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ['>=1.20', '1.17']
+        go: ['>=1.23', '1.22']
         trino: ['latest', '372']
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
       - run: go test -v -race -timeout 2m ./... -trino_image_tag=${{ matrix.trino }}

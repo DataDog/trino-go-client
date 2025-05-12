@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -43,7 +44,7 @@ func TestConfig(t *testing.T) {
 	dsn, err := c.FormatDSN()
 	require.NoError(t, err)
 
-	want := "http://foobar@localhost:8080?session_properties=query_priority%3D1&source=trino-go-client"
+	want := "http://foobar@localhost:8080?session_properties=query_priority%3A1&source=trino-go-client"
 
 	assert.Equal(t, want, dsn)
 }
@@ -58,7 +59,7 @@ func TestConfigSSLCertPath(t *testing.T) {
 	dsn, err := c.FormatDSN()
 	require.NoError(t, err)
 
-	want := "https://foobar@localhost:8080?SSLCertPath=cert.pem&session_properties=query_priority%3D1&source=trino-go-client"
+	want := "https://foobar@localhost:8080?SSLCertPath=cert.pem&session_properties=query_priority%3A1&source=trino-go-client"
 
 	assert.Equal(t, want, dsn)
 }
@@ -105,7 +106,7 @@ FKu5ZAlRfb2aYegr49DHhzoVAdInWQmP+5EZEUD1
 	dsn, err := c.FormatDSN()
 	require.NoError(t, err)
 
-	want := "https://foobar@localhost:8080?SSLCert=" + url.QueryEscape(sslCert) + "&session_properties=query_priority%3D1&source=trino-go-client"
+	want := "https://foobar@localhost:8080?SSLCert=" + url.QueryEscape(sslCert) + "&session_properties=query_priority%3A1&source=trino-go-client"
 
 	assert.Equal(t, want, dsn)
 }
@@ -113,15 +114,59 @@ FKu5ZAlRfb2aYegr49DHhzoVAdInWQmP+5EZEUD1
 func TestExtraCredentials(t *testing.T) {
 	c := &Config{
 		ServerURI:        "http://foobar@localhost:8080",
-		ExtraCredentials: map[string]string{"token": "mYtOkEn", "otherToken": "oThErToKeN"},
+		ExtraCredentials: map[string]string{"token": "mYtOkEn", "otherToken": "oThErToKeN%*!#@special"},
 	}
 
 	dsn, err := c.FormatDSN()
 	require.NoError(t, err)
 
-	want := "http://foobar@localhost:8080?extra_credentials=otherToken%3DoThErToKeN%2Ctoken%3DmYtOkEn&source=trino-go-client"
-
+	want := "http://foobar@localhost:8080?extra_credentials=otherToken%3AoThErToKeN%25%2A%21%23%40special%3Btoken%3AmYtOkEn&source=trino-go-client"
 	assert.Equal(t, want, dsn)
+}
+
+func TestInvalidExtraCredentials(t *testing.T) {
+	testcases := []struct {
+		Name        string
+		Credentials map[string]string
+		Error       string
+	}{
+		{
+			Name:        "Empty key",
+			Credentials: map[string]string{"": "emptyKey"},
+			Error:       "trino: extra_credentials key is empty",
+		},
+		{
+			Name:        "Empty value",
+			Credentials: map[string]string{"valid": "a", "emptyValue": ""},
+			Error:       "trino: extra_credentials value is empty",
+		},
+		{
+			Name:        "Unprintable key",
+			Credentials: map[string]string{"😊": "unprintableKey"},
+			Error:       "trino: extra_credentials key '😊' contains spaces or is not printable ASCII",
+		},
+		{
+			Name:        "Unprintable value",
+			Credentials: map[string]string{"unprintableValue": "😊"},
+			Error:       "trino: extra_credentials value for key 'unprintableValue' contains spaces or is not printable ASCII",
+		},
+	}
+
+	for _, tc := range testcases {
+
+		t.Run(tc.Name, func(t *testing.T) {
+			c := &Config{
+				ServerURI:        "http://foobar@localhost:8080",
+				ExtraCredentials: tc.Credentials,
+			}
+			dsn, err := c.FormatDSN()
+			require.NoError(t, err)
+			db, err := sql.Open("trino", dsn)
+			require.NoError(t, err)
+			err = db.Ping()
+			assert.EqualError(t, err, tc.Error)
+		})
+	}
 }
 
 func TestConfigWithoutSSLCertPath(t *testing.T) {
@@ -132,27 +177,28 @@ func TestConfigWithoutSSLCertPath(t *testing.T) {
 	dsn, err := c.FormatDSN()
 	require.NoError(t, err)
 
-	want := "https://foobar@localhost:8080?session_properties=query_priority%3D1&source=trino-go-client"
+	want := "https://foobar@localhost:8080?session_properties=query_priority%3A1&source=trino-go-client"
 
 	assert.Equal(t, want, dsn)
 }
 
 func TestKerberosConfig(t *testing.T) {
 	c := &Config{
-		ServerURI:          "https://foobar@localhost:8090",
-		SessionProperties:  map[string]string{"query_priority": "1"},
-		KerberosEnabled:    "true",
-		KerberosKeytabPath: "/opt/test.keytab",
-		KerberosPrincipal:  "trino/testhost",
-		KerberosRealm:      "example.com",
-		KerberosConfigPath: "/etc/krb5.conf",
-		SSLCertPath:        "/tmp/test.cert",
+		ServerURI:                 "https://foobar@localhost:8090",
+		SessionProperties:         map[string]string{"query_priority": "1"},
+		KerberosEnabled:           "true",
+		KerberosKeytabPath:        "/opt/test.keytab",
+		KerberosPrincipal:         "trino/testhost",
+		KerberosRealm:             "example.com",
+		KerberosConfigPath:        "/etc/krb5.conf",
+		KerberosRemoteServiceName: "service",
+		SSLCertPath:               "/tmp/test.cert",
 	}
 
 	dsn, err := c.FormatDSN()
 	require.NoError(t, err)
 
-	want := "https://foobar@localhost:8090?KerberosConfigPath=%2Fetc%2Fkrb5.conf&KerberosEnabled=true&KerberosKeytabPath=%2Fopt%2Ftest.keytab&KerberosPrincipal=trino%2Ftesthost&KerberosRealm=example.com&SSLCertPath=%2Ftmp%2Ftest.cert&session_properties=query_priority%3D1&source=trino-go-client"
+	want := "https://foobar@localhost:8090?KerberosConfigPath=%2Fetc%2Fkrb5.conf&KerberosEnabled=true&KerberosKeytabPath=%2Fopt%2Ftest.keytab&KerberosPrincipal=trino%2Ftesthost&KerberosRealm=example.com&KerberosRemoteServiceName=service&SSLCertPath=%2Ftmp%2Ftest.cert&session_properties=query_priority%3A1&source=trino-go-client"
 
 	assert.Equal(t, want, dsn)
 }
@@ -165,6 +211,20 @@ func TestInvalidKerberosConfig(t *testing.T) {
 
 	_, err := c.FormatDSN()
 	assert.Error(t, err, "dsn generated from invalid secure url, since kerberos enabled must has SSL enabled")
+}
+
+func TestAccessTokenConfig(t *testing.T) {
+	c := &Config{
+		ServerURI:   "https://foobar@localhost:8090",
+		AccessToken: "token",
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	want := "https://foobar@localhost:8090?accessToken=token&source=trino-go-client"
+
+	assert.Equal(t, want, dsn)
 }
 
 func TestConfigWithMalformedURL(t *testing.T) {
@@ -206,7 +266,79 @@ func TestRegisterCustomClientReserved(t *testing.T) {
 	}
 }
 
+func TestQueryTimeout(t *testing.T) {
+	timeout := 10 * time.Second
+	c := &Config{
+		ServerURI:    "https://foobar@localhost:8090",
+		QueryTimeout: &timeout,
+	}
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	want := "https://foobar@localhost:8090?query_timeout=10s&source=trino-go-client"
+	assert.Equal(t, want, dsn)
+}
+
 func TestRoundTripRetryQueryError(t *testing.T) {
+	testcases := []struct {
+		Name                string
+		HttpStatus          int
+		ExpectedErrorStatus string
+	}{
+		{
+			Name:                "Test retry 502 Bad Gateway",
+			HttpStatus:          http.StatusBadGateway,
+			ExpectedErrorStatus: "200 OK",
+		},
+		{
+			Name:                "Test retry 503 Service Unavailable",
+			HttpStatus:          http.StatusServiceUnavailable,
+			ExpectedErrorStatus: "200 OK",
+		},
+		{
+			Name:                "Test retry 504 Gateway Timeout",
+			HttpStatus:          http.StatusGatewayTimeout,
+			ExpectedErrorStatus: "200 OK",
+		},
+		{
+			Name:                "Test no retry 404 Not Found",
+			HttpStatus:          http.StatusNotFound,
+			ExpectedErrorStatus: "404 Not Found",
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.Name, func(t *testing.T) {
+			count := 0
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if count == 0 {
+					count++
+					w.WriteHeader(tc.HttpStatus)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(&stmtResponse{
+					Error: ErrTrino{
+						ErrorName: "TEST",
+					},
+				})
+			}))
+
+			t.Cleanup(ts.Close)
+
+			db, err := sql.Open("trino", ts.URL)
+			require.NoError(t, err)
+
+			t.Cleanup(func() {
+				assert.NoError(t, db.Close())
+			})
+
+			_, err = db.Query("SELECT 1")
+			assert.ErrorContains(t, err, tc.ExpectedErrorStatus, "unexpected error: %w", err)
+		})
+	}
+}
+
+func TestRoundTripBogusData(t *testing.T) {
 	count := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if count == 0 {
@@ -215,11 +347,8 @@ func TestRoundTripRetryQueryError(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(&stmtResponse{
-			Error: stmtError{
-				ErrorName: "TEST",
-			},
-		})
+		// some invalid JSON
+		w.Write([]byte(`{"stats": {"progressPercentage": ""}}`))
 	}))
 
 	t.Cleanup(ts.Close)
@@ -231,8 +360,10 @@ func TestRoundTripRetryQueryError(t *testing.T) {
 		assert.NoError(t, db.Close())
 	})
 
-	_, err = db.Query("SELECT 1")
-	assert.IsTypef(t, new(ErrQueryFailed), err, "unexpected error: %w", err)
+	rows, err := db.Query("SELECT 1")
+	require.NoError(t, err)
+	assert.False(t, rows.Next())
+	require.NoError(t, rows.Err())
 }
 
 func TestRoundTripCancellation(t *testing.T) {
@@ -269,6 +400,26 @@ func TestAuthFailure(t *testing.T) {
 	assert.NoError(t, db.Close())
 }
 
+func TestTokenAuth(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer token" {
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+
+	t.Cleanup(ts.Close)
+
+	db, err := sql.Open("trino", ts.URL+"?accessToken=token")
+	require.NoError(t, err)
+
+	_, err = db.Query("SELECT 1")
+	require.Error(t, err, "trino: EOF")
+
+	assert.NoError(t, db.Close())
+}
+
 func TestQueryForUsername(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping test in short mode.")
@@ -301,10 +452,12 @@ func TestQueryForUsername(t *testing.T) {
 }
 
 type TestQueryProgressCallback struct {
-	statusMap map[time.Time]string
+	progressMap map[time.Time]float64
+	statusMap   map[time.Time]string
 }
 
 func (qpc *TestQueryProgressCallback) Update(qpi QueryProgressInfo) {
+	qpc.progressMap[time.Now()] = float64(qpi.QueryStats.ProgressPercentage)
 	qpc.statusMap[time.Now()] = qpi.QueryStats.State
 }
 
@@ -352,11 +505,14 @@ func TestQueryProgressWithCallbackPeriod(t *testing.T) {
 		assert.NoError(t, db.Close())
 	})
 
+	progressMap := make(map[time.Time]float64)
 	statusMap := make(map[time.Time]string)
 	progressUpdater := &TestQueryProgressCallback{
-		statusMap: statusMap,
+		progressMap: progressMap,
+		statusMap:   statusMap,
 	}
 	progressUpdaterPeriod, err := time.ParseDuration("1ms")
+	require.NoError(t, err)
 
 	rows, err := db.Query("SELECT 2",
 		sql.Named("X-Trino-Progress-Callback", progressUpdater),
@@ -380,6 +536,8 @@ func TestQueryProgressWithCallbackPeriod(t *testing.T) {
 	}
 
 	// sort time in order to calculate interval
+	assert.NotEmpty(t, progressMap)
+	assert.NotEmpty(t, statusMap)
 	var keys []time.Time
 	for k := range statusMap {
 		keys = append(keys, k)
@@ -392,6 +550,7 @@ func TestQueryProgressWithCallbackPeriod(t *testing.T) {
 		if i > 0 {
 			assert.GreaterOrEqual(t, k.Sub(keys[i-1]), progressUpdaterPeriod)
 		}
+		assert.GreaterOrEqual(t, progressMap[k], 0.0)
 	}
 }
 
@@ -619,7 +778,7 @@ func TestQueryColumns(t *testing.T) {
 			0,
 			false,
 			0,
-			reflect.TypeOf(sql.NullString{}),
+			reflect.TypeOf([]byte{}),
 		},
 		{
 			"JSON",
@@ -920,7 +1079,7 @@ func TestQueryCancellation(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(&stmtResponse{
-			Error: stmtError{
+			Error: ErrTrino{
 				ErrorName: "USER_CANCELLED",
 			},
 		})
@@ -984,7 +1143,7 @@ func TestFetchNoStackOverflow(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(&stmtResponse{
-			Error: stmtError{
+			Error: ErrTrino{
 				ErrorName: "TEST",
 			},
 		})
@@ -1000,6 +1159,735 @@ func TestFetchNoStackOverflow(t *testing.T) {
 	_, err = db.Query("SELECT 1")
 	assert.IsTypef(t, new(ErrQueryFailed), err, "unexpected error: %w", err)
 
+}
+
+func TestSpoolingProtocolSpooledSegmentDecoders(t *testing.T) {
+	testcases := []struct {
+		Name           string
+		Segments       []map[string]interface{}
+		ExpectedResult []int
+		Encoding       string
+		DownloadedData []byte
+	}{
+		{
+			Name: "noCompression",
+			Segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"segmentSize": 16, "rowOffset": 0, "rowsCount": 2},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			Encoding:       "json",
+			ExpectedResult: []int{1000, 10001},
+			DownloadedData: []byte("[[1000],[10001]]"),
+		},
+		{
+			Name: "zstdCompression",
+			Segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"uncompressedSize": 16, "rowOffset": 2, "segmentSize": 29},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			Encoding:       "json+zstd",
+			ExpectedResult: []int{1000, 10001},
+			DownloadedData: mustDecodeBase64("KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw="),
+		},
+		{
+			Name: "zlibCompression",
+			Segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"uncompressedSize": 16, "rowOffset": 2, "segmentSize": 18},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			Encoding:       "json+lz4",
+			ExpectedResult: []int{1000, 10001},
+			DownloadedData: mustDecodeBase64("8AFbWzEwMDBdLFsxMDAwMV1d"),
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.Name, func(t *testing.T) {
+			var ts *httptest.Server
+			ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/statement" {
+					json.NewEncoder(w).Encode(&stmtResponse{
+						ID:      "fake-query",
+						NextURI: ts.URL + "/v1/statement/20210817_140827_00000_arvdv/1",
+					})
+
+					return
+				}
+				if r.URL.Path == "/v1/statement/20210817_140827_00000_arvdv/1" {
+					json.NewEncoder(w).Encode(&queryResponse{
+						ID: "fake-query",
+						Columns: []queryColumn{
+							{
+								Name: "_col0",
+								Type: "integer",
+								TypeSignature: typeSignature{
+									RawType:   "integer",
+									Arguments: []typeArgument{},
+								},
+							},
+						},
+						Data: map[string]interface{}{
+							"encoding": tc.Encoding,
+							"segments": tc.Segments,
+						},
+					})
+					return
+				}
+				if r.URL.Path == "/v1/spooled/download/jKaLK0aVkNp2ixl6BOuwGMJ0nRjbUVKLHW_f3-I-1Cc=" {
+					w.Write(tc.DownloadedData)
+					return
+				}
+
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrTrino{ErrorName: "Unexpected request"})
+			}))
+
+			defer ts.Close()
+
+			tc.Segments[0]["uri"] = ts.URL + "/v1/spooled/download/jKaLK0aVkNp2ixl6BOuwGMJ0nRjbUVKLHW_f3-I-1Cc="
+
+			db, err := sql.Open("trino", ts.URL)
+			require.NoError(t, err)
+			defer db.Close()
+
+			rows, err := db.Query("SELECT 1")
+			require.NoError(t, err)
+
+			var results []int
+			for rows.Next() {
+				var value int
+				err := rows.Scan(&value)
+				require.NoError(t, err)
+				results = append(results, value)
+			}
+
+			require.NoError(t, rows.Err())
+
+			assert.Equal(t, tc.ExpectedResult, results, "Expected query results to match")
+		})
+	}
+}
+
+func mustDecodeBase64(encoded string) []byte {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to decode base64: %v", err))
+	}
+	return data
+}
+
+func TestSpoolingProtocolInlineSegmentDecoders(t *testing.T) {
+	testcases := []struct {
+		Name           string
+		Segments       []map[string]interface{}
+		ExpectedResult []int
+		Encoding       string
+	}{
+		{
+			Name: "noCompression",
+			Segments: []map[string]interface{}{
+				{
+					"type":     "inline",
+					"data":     "W1sxMDAwXSwgWzEwMDAxXV0=",
+					"metadata": map[string]interface{}{"segmentSize": 17, "rowOffset": 2},
+				},
+			},
+			Encoding:       "json",
+			ExpectedResult: []int{1000, 10001},
+		},
+		{
+			Name: "zstdCompression",
+			Segments: []map[string]interface{}{
+				{
+					"type":     "inline",
+					"data":     "KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw=",
+					"metadata": map[string]interface{}{"uncompressedSize": 16, "rowOffset": 2, "segmentSize": 29},
+				},
+			},
+			Encoding:       "json+zstd",
+			ExpectedResult: []int{1000, 10001},
+		},
+		{
+			Name: "zlibCompression",
+			Segments: []map[string]interface{}{
+				{
+					"type":     "inline",
+					"data":     "8AFbWzEwMDBdLFsxMDAwMV1d",
+					"metadata": map[string]interface{}{"uncompressedSize": 16, "rowOffset": 2, "segmentSize": 18},
+				},
+			},
+			Encoding:       "json+lz4",
+			ExpectedResult: []int{1000, 10001},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.Name, func(t *testing.T) {
+			var ts *httptest.Server
+
+			ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/statement" {
+					json.NewEncoder(w).Encode(&stmtResponse{
+						ID:      "fake-query",
+						NextURI: ts.URL + "/v1/statement/20210817_140827_00000_arvdv/1",
+					})
+
+					return
+				}
+				if r.URL.Path == "/v1/statement/20210817_140827_00000_arvdv/1" {
+					json.NewEncoder(w).Encode(&queryResponse{
+						ID: "fake-query",
+						Columns: []queryColumn{
+							{
+								Name: "_col0",
+								Type: "integer",
+								TypeSignature: typeSignature{
+									RawType:   "integer",
+									Arguments: []typeArgument{},
+								},
+							},
+						},
+						Data: map[string]interface{}{
+							"encoding": tc.Encoding,
+							"segments": tc.Segments,
+						},
+					})
+					return
+				}
+
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrTrino{ErrorName: "Unexpected request"})
+			}))
+
+			defer ts.Close()
+
+			db, err := sql.Open("trino", ts.URL)
+			require.NoError(t, err)
+			defer db.Close()
+
+			rows, err := db.Query("SELECT 1")
+			require.NoError(t, err)
+
+			var results []int
+			for rows.Next() {
+				var value int
+				err := rows.Scan(&value)
+				require.NoError(t, err)
+				results = append(results, value)
+			}
+
+			require.NoError(t, rows.Err())
+
+			assert.Equal(t, tc.ExpectedResult, results, "Expected query results to match")
+		})
+	}
+}
+
+func TestSpoolingProtocolSpooledSegmentErrorHandling(t *testing.T) {
+	testcases := []struct {
+		name                          string
+		segments                      []map[string]interface{}
+		expectedError                 string
+		downloadedData                []byte
+		downloadedDataStatusCodeError bool
+	}{
+		{
+			name: "MissingRowOffsetMetadata",
+			segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"uncompressedSize": 2, "segmentSize": 11},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			expectedError: "rowOffset is missing in segment metadata",
+		},
+		{
+			name: "WrongRowOffsetMetadataType",
+			segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"uncompressedSize": 2, "rowOffset": "2", "segmentSize": 11},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			expectedError: "invalid type for rowOffset in segment metadata, expected json.Number",
+		},
+		{
+			name: "MissingSegmentSizeMetadata",
+			segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"uncompressedSize": 2, "rowOffset": 2},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			expectedError: "segmentSize is missing in segment metadata",
+		},
+		{
+			name: "WrongSegmentSizeMetadataType",
+			segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"uncompressedSize": 2, "rowOffset": 2, "segmentSize": "11"},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			expectedError: "invalid type for segmentSize in segment metadata, expected json.Number",
+		},
+		{
+			name: "MissingMetadata",
+			segments: []map[string]interface{}{
+				{
+					"type":   "spooled",
+					"ackUri": "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			expectedError: "metadata is missing in segment at index 0",
+		},
+		{
+			name: "WrongMetadataType",
+			segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": "fake-metadata",
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			expectedError: "metadata is invalid or cannot be parsed as map[string]interface{} in segment at index 0",
+		},
+		{
+			name: "WrongUncompressSize",
+			segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"uncompressedSize": 2, "rowOffset": 2, "segmentSize": 11},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			expectedError:  "failed to decode spooled segment at index 0: segment size mismatch: expected 11 bytes, got 29 byte",
+			downloadedData: mustDecodeBase64("KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw="),
+		},
+		{
+			name: "WrongCompresSize",
+			segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"uncompressedSize": 2, "rowOffset": 2, "segmentSize": 29},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			expectedError:  "decompressed size mismatch: expected 2 bytes, got 16 bytes",
+			downloadedData: mustDecodeBase64("KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw="),
+		},
+		{
+			name: "MissingUri",
+			segments: []map[string]interface{}{
+				{
+					"type":   "spooled",
+					"data":   "fake-data",
+					"ackUri": "test",
+					"metadata": map[string]interface{}{
+						"segmentSize":      3679,
+						"uncompressedSize": 2,
+						"rowOffset":        0,
+					},
+					"headers": map[string][]interface{}{
+						"x-amz-server-side-encryption-customer-algorithm": {"AES256"},
+						"x-amz-server-side-encryption-customer-key":       {"key"},
+						"x-amz-server-side-encryption-customer-key-md5":   {"md5"},
+					},
+				},
+			},
+			expectedError: "missing or invalid 'uri' field in spooled segment at index 0",
+		},
+		{
+			name: "MissingUriAck",
+			segments: []map[string]interface{}{
+				{
+					"type": "spooled",
+					"data": "fake-data",
+					"uri":  "fake-uri",
+					"metadata": map[string]interface{}{
+						"segmentSize":      3679,
+						"uncompressedSize": 2,
+						"rowOffset":        0,
+					},
+					"headers": map[string][]interface{}{
+						"x-amz-server-side-encryption-customer-algorithm": {"AES256"},
+						"x-amz-server-side-encryption-customer-key":       {"key"},
+						"x-amz-server-side-encryption-customer-key-md5":   {"md5"},
+					},
+				},
+			},
+			expectedError: "missing or invalid 'ackUri' field in spooled segment at index 0",
+		},
+		{
+			name: "MissingHeaders",
+			segments: []map[string]interface{}{
+				{
+					"type":   "spooled",
+					"data":   "fake-data",
+					"uri":    "fake-uri",
+					"ackUri": "test",
+					"metadata": map[string]interface{}{
+						"segmentSize":      3679,
+						"uncompressedSize": 2,
+						"rowOffset":        0,
+					},
+				},
+			},
+			expectedError: "missing or invalid 'headers' field in spooled segment at index 0",
+		},
+		{
+			name: "HeadersWithMultipleValues",
+			segments: []map[string]interface{}{
+				{
+					"type":   "spooled",
+					"data":   "fake-data",
+					"uri":    "fake-uri",
+					"ackUri": "test",
+					"metadata": map[string]interface{}{
+						"segmentSize":      3679,
+						"uncompressedSize": 2,
+						"rowOffset":        0,
+					},
+					"headers": map[string][]interface{}{
+						"x-amz-server-side-encryption-customer-algorithm": {"AES256"},
+						"x-amz-server-side-encryption-customer-key":       {"key"},
+						"x-amz-server-side-encryption-customer-key-md5":   {"md5", "md5"}, // wrong, more then one
+					},
+				},
+			},
+			expectedError: "multiple values for header x-amz-server-side-encryption-customer-key-md5",
+		},
+		{
+			name: "HeaderValueWrongType",
+			segments: []map[string]interface{}{
+				{
+					"type":   "spooled",
+					"data":   "fake-data",
+					"uri":    "fake-uri",
+					"ackUri": "test",
+					"metadata": map[string]interface{}{
+						"segmentSize":      3679,
+						"uncompressedSize": 2,
+						"rowOffset":        0,
+					},
+					"headers": map[string]interface{}{
+						"x-amz-server-side-encryption-customer-algorithm": []interface{}{"AES256"},
+						"x-amz-server-side-encryption-customer-key":       []interface{}{"key"},
+						"x-amz-server-side-encryption-customer-key-md5":   []interface{}{123}, // Wrong type: integer instead of string
+					},
+				},
+			},
+			expectedError: "unsupported header value type json.Number",
+		},
+		{
+			name: "HeaderTypeInvalid",
+			segments: []map[string]interface{}{
+				{
+					"type":   "spooled",
+					"data":   "fake-data",
+					"uri":    "fake-uri",
+					"ackUri": "test",
+					"metadata": map[string]interface{}{
+						"segmentSize":      3679,
+						"uncompressedSize": 2,
+						"rowOffset":        0,
+					},
+					"headers": map[string]interface{}{
+						"x-amz-server-side-encryption-customer-algorithm": "AES256", // Invalid type: string instead of []interface{}
+					},
+				},
+			},
+			expectedError: "unsupported header type string",
+		},
+		{
+			name: "ErrorDownloadingSegment",
+			segments: []map[string]interface{}{
+				{
+					"type":     "spooled",
+					"metadata": map[string]interface{}{"uncompressedSize": 2, "rowOffset": 2, "segmentSize": 11},
+					"ackUri":   "test",
+					"headers": map[string]interface{}{
+						"test": []interface{}{"test"},
+					},
+				},
+			},
+			expectedError:                 "trino: query failed (500 Internal Server Error):",
+			downloadedData:                mustDecodeBase64("KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw="),
+			downloadedDataStatusCodeError: true,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ts *httptest.Server
+
+			ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/statement" {
+					json.NewEncoder(w).Encode(&stmtResponse{
+						ID:      "fake-query",
+						NextURI: ts.URL + "/v1/statement/20210817_140827_00000_arvdv/1",
+					})
+
+					return
+				}
+				if r.URL.Path == "/v1/statement/20210817_140827_00000_arvdv/1" {
+					json.NewEncoder(w).Encode(&queryResponse{
+						ID: "fake-query",
+						Columns: []queryColumn{
+							{
+								Name: "_col0",
+								Type: "integer",
+								TypeSignature: typeSignature{
+									RawType:   "integer",
+									Arguments: []typeArgument{},
+								},
+							},
+						},
+						Data: map[string]interface{}{
+							"encoding": "json+zstd",
+							"segments": tc.segments,
+						},
+					})
+					return
+				}
+
+				if r.URL.Path == "/v1/spooled/download/jKaLK0aVkNp2ixl6BOuwGMJ0nRjbUVKLHW_f3-I-1Cc=" {
+					if tc.downloadedDataStatusCodeError {
+						w.WriteHeader(http.StatusInternalServerError)
+					}
+
+					w.Write(tc.downloadedData)
+					return
+				}
+
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrTrino{ErrorName: "Unexpected request"})
+			}))
+
+			defer ts.Close()
+
+			if tc.name != "MissingUri" {
+				tc.segments[0]["uri"] = ts.URL + "/v1/spooled/download/jKaLK0aVkNp2ixl6BOuwGMJ0nRjbUVKLHW_f3-I-1Cc="
+			}
+
+			db, err := sql.Open("trino", ts.URL)
+			require.NoError(t, err)
+			defer db.Close()
+
+			_, err = db.Query("SELECT 1")
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+func TestSpoolingProtocolInlineSegmentErrorHandling(t *testing.T) {
+	testcases := []struct {
+		name          string
+		segments      []map[string]interface{}
+		expectedError string
+	}{
+		{
+			name: "WrongUncompressSize",
+			segments: []map[string]interface{}{
+				{
+					"type":     "inline",
+					"data":     "KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw=",
+					"metadata": map[string]interface{}{"uncompressedSize": 1, "rowOffset": 2, "segmentSize": 29},
+				},
+			},
+			expectedError: "failed to decode inline segment at index 0: decompressed size mismatch: expected 1 bytes, got 16 bytes",
+		},
+		{
+			name: "WrongCompresSize",
+			segments: []map[string]interface{}{
+				{
+					"type":     "inline",
+					"data":     "KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw=",
+					"metadata": map[string]interface{}{"uncompressedSize": 16, "rowOffset": 2, "segmentSize": 1},
+				},
+			},
+			expectedError: "failed to decode inline segment at index 0: segment size mismatch: expected 1 bytes, got 29 bytes",
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ts *httptest.Server
+
+			ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/statement" {
+					json.NewEncoder(w).Encode(&stmtResponse{
+						ID:      "fake-query",
+						NextURI: ts.URL + "/v1/statement/20210817_140827_00000_arvdv/1",
+					})
+
+					return
+				}
+				if r.URL.Path == "/v1/statement/20210817_140827_00000_arvdv/1" {
+					json.NewEncoder(w).Encode(&queryResponse{
+						ID: "fake-query",
+						Columns: []queryColumn{
+							{
+								Name: "_col0",
+								Type: "integer",
+								TypeSignature: typeSignature{
+									RawType:   "integer",
+									Arguments: []typeArgument{},
+								},
+							},
+						},
+						Data: map[string]interface{}{
+							"encoding": "json+zstd",
+							"segments": tc.segments,
+						},
+					})
+					return
+				}
+
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrTrino{ErrorName: "Unexpected request"})
+			}))
+
+			defer ts.Close()
+
+			if tc.name != "MissingUri" {
+				tc.segments[0]["uri"] = ts.URL + "/v1/spooled/download/jKaLK0aVkNp2ixl6BOuwGMJ0nRjbUVKLHW_f3-I-1Cc="
+			}
+
+			db, err := sql.Open("trino", ts.URL)
+			require.NoError(t, err)
+			defer db.Close()
+
+			_, err = db.Query("SELECT 1")
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+func TestProtocolErrorHandling(t *testing.T) {
+	testcases := []struct {
+		name          string
+		data          interface{}
+		expectedError string
+	}{
+		{
+			name: "DirectProtocolInvalidRowType",
+			data: []interface{}{
+				123,
+			},
+			expectedError: "unexpected data type for row at index 0: expected []interface{}, got json.Number",
+		},
+		{
+			name: "SpoolingProtocolMissingEncoding",
+			data: map[string]interface{}{
+				"segments": []interface{}{}, // Missing "encoding" field
+			},
+			expectedError: "invalid or missing 'encoding' field on spooling protocol, expected string",
+		},
+		{
+			name: "SpoolingProtocolInvalidSegmentsType",
+			data: map[string]interface{}{
+				"encoding": "json",
+				"segments": "invalid", // Invalid type for "segments"
+			},
+			expectedError: "nvalid or missing 'segments' field on spooling protocol, expected []interface{}",
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ts *httptest.Server
+
+			ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/statement" {
+					json.NewEncoder(w).Encode(&stmtResponse{
+						ID:      "fake-query",
+						NextURI: ts.URL + "/v1/statement/20210817_140827_00000_arvdv/1",
+					})
+
+					return
+				}
+				if r.URL.Path == "/v1/statement/20210817_140827_00000_arvdv/1" {
+					json.NewEncoder(w).Encode(&queryResponse{
+						ID: "fake-query",
+						Columns: []queryColumn{
+							{
+								Name: "_col0",
+								Type: "integer",
+								TypeSignature: typeSignature{
+									RawType:   "integer",
+									Arguments: []typeArgument{},
+								},
+							},
+						},
+						Data: tc.data,
+					})
+					return
+				}
+
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrTrino{ErrorName: "Unexpected request"})
+			}))
+
+			defer ts.Close()
+
+			db, err := sql.Open("trino", ts.URL)
+			require.NoError(t, err)
+			defer db.Close()
+
+			_, err = db.Query("SELECT 1")
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
 }
 
 func TestSession(t *testing.T) {
@@ -1419,6 +2307,19 @@ func TestTypeConversion(t *testing.T) {
 				[]interface{}{"b"},
 			},
 		},
+		{
+			DataType:                   "Geometry",
+			RawType:                    "Geometry",
+			ResponseUnmarshalledSample: "Point (0 0)",
+			ExpectedGoValue:            "Point (0 0)",
+		},
+
+		{
+			DataType:                   "SphericalGeography",
+			RawType:                    "SphericalGeography",
+			ResponseUnmarshalledSample: "Point (0 0)",
+			ExpectedGoValue:            "Point (0 0)",
+		},
 	}
 
 	for _, tc := range testcases {
@@ -1717,5 +2618,245 @@ func BenchmarkQuery(b *testing.B) {
 		for rows.Next() {
 		}
 		rows.Close()
+	}
+}
+
+// BenchmarkSpoolingProtocolSpooledSegmentlJsonZstdDecoderQuery benchmarks the performance of querying a large dataset
+// from Trino with JSON encoding and Zstd compression, testing the spooling mechanism. The query retrieves a result set
+// of 10 million rows, exceeding the default inline row limit of 1000 (defined by `protocol.spooling.inlining.max-rows`),
+// triggering the spooling mechanism to handle the large data efficiently.
+//
+// **Session properties & headers:**
+// - **`encoding: json+zstd`**: Specifies JSON encoding with Zstd compression for the query result.
+// - **`protocol.spooling.inlining.max-rows`**: Default is 1000, determining when spooling is triggered to manage large result sets.
+func BenchmarkSpoolingProtocolSpooledSegmentlJsonZstdDecoderQuery(b *testing.B) {
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(b, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(b, err)
+
+	b.Cleanup(func() {
+		assert.NoError(b, db.Close())
+	})
+
+	q := `SELECT * FROM tpch.sf1.orders LIMIT 10000000`
+	for n := 0; n < b.N; n++ {
+		rows, err := db.Query(q, sql.Named(trinoEncoding, "json+zstd"))
+		require.NoError(b, err)
+		for rows.Next() {
+		}
+		rows.Close()
+	}
+}
+
+// BenchmarkSpoolingProtocolSpooledSegmentJsonLz4DecoderQuery benchmarks the performance of querying a large dataset
+// from Trino with JSON encoding and LZ4 compression, testing the spooling mechanism. The query retrieves a result set
+// of 10 million rows, exceeding the default inline row limit of 1000 (defined by `protocol.spooling.inlining.max-rows`),
+// triggering the spooling mechanism to handle the large data efficiently.
+//
+// **Session properties & headers:**
+// - **`encoding: json+lz4`**: Specifies JSON encoding with LZ4 compression for the query result.
+// - **`protocol.spooling.inlining.max-rows`**: Default is 1000, determining when spooling is triggered to manage large result sets.
+func BenchmarkSpoolingProtocolSpooledSegmentJsonLz4DecoderQuery(b *testing.B) {
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(b, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(b, err)
+
+	b.Cleanup(func() {
+		assert.NoError(b, db.Close())
+	})
+
+	q := `SELECT * FROM tpch.sf1.orders LIMIT 10000000`
+	for n := 0; n < b.N; n++ {
+		rows, err := db.Query(q, sql.Named(trinoEncoding, "json+lz4"))
+		require.NoError(b, err)
+		for rows.Next() {
+		}
+		rows.Close()
+	}
+}
+
+// BenchmarkSpoolingProtocolSpooledSegmentJsonDecoderQuery benchmarks the performance of querying a large dataset
+// from Trino with JSON encoding (without compression), testing the spooling mechanism. The query retrieves a result set
+// of 10 million rows, exceeding the default inline row limit of 1000 (defined by `protocol.spooling.inlining.max-rows`),
+// triggering the spooling mechanism to handle the large data efficiently.
+//
+// **Session properties & headers:**
+// - **`encoding: json`**: Specifies JSON encoding without compression for the query result.
+// - **`protocol.spooling.inlining.max-rows`**: Default is 1000, determining when spooling is triggered to manage large result sets
+func BenchmarkSpoolingProtocolSpooledSegmentJsonDecoderQuery(b *testing.B) {
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(b, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(b, err)
+
+	b.Cleanup(func() {
+		assert.NoError(b, db.Close())
+	})
+
+	q := `SELECT * FROM tpch.sf1.orders LIMIT 10000000`
+	for n := 0; n < b.N; n++ {
+		rows, err := db.Query(q, sql.Named(trinoEncoding, "json"))
+		require.NoError(b, err)
+		for rows.Next() {
+		}
+		rows.Close()
+	}
+}
+
+func TestExec(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping test in short mode.")
+	}
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, db.Close())
+	})
+
+	_, err = db.Exec("CREATE TABLE memory.default.test (id INTEGER, name VARCHAR, optional VARCHAR)")
+	require.NoError(t, err, "Failed executing CREATE TABLE query")
+
+	result, err := db.Exec("INSERT INTO memory.default.test (id, name, optional) VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?)",
+		123, "abc", nil,
+		456, "def", "present",
+		789, "ghi", nil)
+	require.NoError(t, err, "Failed executing INSERT query")
+	_, err = result.LastInsertId()
+	assert.Error(t, err, "trino: operation not supported")
+	numRows, err := result.RowsAffected()
+	require.NoError(t, err, "Failed checking rows affected")
+	assert.Equal(t, numRows, int64(3))
+
+	rows, err := db.Query("SELECT * FROM memory.default.test")
+	require.NoError(t, err, "Failed executing DELETE query")
+
+	expectedIds := []int{123, 456, 789}
+	expectedNames := []string{"abc", "def", "ghi"}
+	expectedOptionals := []sql.NullString{
+		sql.NullString{Valid: false},
+		sql.NullString{String: "present", Valid: true},
+		sql.NullString{Valid: false},
+	}
+	actualIds := []int{}
+	actualNames := []string{}
+	actualOptionals := []sql.NullString{}
+	for rows.Next() {
+		var id int
+		var name string
+		var optional sql.NullString
+		require.NoError(t, rows.Scan(&id, &name, &optional), "Failed scanning query result")
+		actualIds = append(actualIds, id)
+		actualNames = append(actualNames, name)
+		actualOptionals = append(actualOptionals, optional)
+
+	}
+	assert.Equal(t, expectedIds, actualIds)
+	assert.Equal(t, expectedNames, actualNames)
+	assert.Equal(t, expectedOptionals, actualOptionals)
+
+	_, err = db.Exec("DROP TABLE memory.default.test")
+	require.NoError(t, err, "Failed executing DROP TABLE query")
+}
+
+func TestForwardAuthorizationHeaderConfig(t *testing.T) {
+	c := &Config{
+		ServerURI:                  "https://foobar@localhost:8090",
+		ForwardAuthorizationHeader: true,
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	want := "https://foobar@localhost:8090?forwardAuthorizationHeader=true&source=trino-go-client"
+
+	assert.Equal(t, want, dsn)
+}
+
+func TestForwardAuthorizationHeader(t *testing.T) {
+	var captureAuthHeader string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Capture the Authorization header for later inspection
+		captureAuthHeader = r.Header.Get("Authorization")
+	}))
+
+	t.Cleanup(ts.Close)
+
+	db, err := sql.Open("trino", ts.URL+"?forwardAuthorizationHeader=true")
+	require.NoError(t, err)
+
+	_, _ = db.Query("SELECT 1", sql.Named("accessToken", string("token"))) // Ingore response to focus on header capture
+	require.Equal(t, "Bearer token", captureAuthHeader, "Authorization header is incorrect")
+
+	assert.NoError(t, db.Close())
+}
+
+func TestQueryTimeoutDeadline(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond) // Simulate slow response
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	testcases := []struct {
+		name          string
+		queryTimeout  string
+		expectedError string
+	}{
+		{
+			name:          "with timeout",
+			queryTimeout:  "100ms",
+			expectedError: "context deadline exceeded",
+		},
+		{
+			name:          "without timeout",
+			queryTimeout:  "10s",
+			expectedError: "EOF", // Default server response
+		},
+		{
+			name:          "bad timeout",
+			queryTimeout:  "abc",
+			expectedError: "trino: invalid timeout", // Default server response
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			println(ts.URL + "?query_timeout=" + tc.queryTimeout)
+			db, err := sql.Open("trino", ts.URL+"?query_timeout="+tc.queryTimeout)
+			require.NoError(t, err)
+			defer db.Close()
+
+			_, err = db.Query("SELECT 1")
+			assert.ErrorContains(t, err, tc.expectedError)
+		})
 	}
 }

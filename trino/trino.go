@@ -51,19 +51,21 @@
 package trino
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
@@ -72,9 +74,12 @@ import (
 	"time"
 	"unicode"
 
-	"gopkg.in/jcmturner/gokrb5.v6/client"
-	"gopkg.in/jcmturner/gokrb5.v6/config"
-	"gopkg.in/jcmturner/gokrb5.v6/keytab"
+	"github.com/jcmturner/gokrb5/v8/client"
+	"github.com/jcmturner/gokrb5/v8/config"
+	"github.com/jcmturner/gokrb5/v8/keytab"
+	"github.com/jcmturner/gokrb5/v8/spnego"
+	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4"
 )
 
 func init() {
@@ -83,7 +88,7 @@ func init() {
 
 var (
 	// DefaultQueryTimeout is the default timeout for queries executed without a context.
-	DefaultQueryTimeout = 60 * time.Second
+	DefaultQueryTimeout = 10 * time.Hour
 
 	// DefaultCancelQueryTimeout is the timeout for the request to cancel queries in Trino.
 	DefaultCancelQueryTimeout = 30 * time.Second
@@ -129,13 +134,25 @@ const (
 	trinoAddedPrepareHeader       = trinoHeaderPrefix + `Added-Prepare`
 	trinoDeallocatedPrepareHeader = trinoHeaderPrefix + `Deallocated-Prepare`
 
-	KerberosEnabledConfig    = "KerberosEnabled"
-	kerberosKeytabPathConfig = "KerberosKeytabPath"
-	kerberosPrincipalConfig  = "KerberosPrincipal"
-	kerberosRealmConfig      = "KerberosRealm"
-	kerberosConfigPathConfig = "KerberosConfigPath"
-	SSLCertPathConfig        = "SSLCertPath"
-	SSLCertConfig            = "SSLCert"
+	trinoQueryDataEncodingHeader = trinoHeaderPrefix + `Query-Data-Encoding`
+	trinoEncoding                = "encoding"
+
+	authorizationHeader = "Authorization"
+
+	kerberosEnabledConfig            = "KerberosEnabled"
+	kerberosKeytabPathConfig         = "KerberosKeytabPath"
+	kerberosPrincipalConfig          = "KerberosPrincipal"
+	kerberosRealmConfig              = "KerberosRealm"
+	kerberosConfigPathConfig         = "KerberosConfigPath"
+	kerberosRemoteServiceNameConfig  = "KerberosRemoteServiceName"
+	sslCertPathConfig                = "SSLCertPath"
+	sslCertConfig                    = "SSLCert"
+	accessTokenConfig                = "accessToken"
+	explicitPrepareConfig            = "explicitPrepare"
+	forwardAuthorizationHeaderConfig = "forwardAuthorizationHeader"
+
+	mapKeySeparator   = ":"
+	mapEntrySeparator = ";"
 )
 
 var (
@@ -159,20 +176,24 @@ var _ driver.Driver = &Driver{}
 
 // Config is a configuration that can be encoded to a DSN string.
 type Config struct {
-	ServerURI          string            // URI of the Trino server, e.g. http://user@localhost:8080
-	Source             string            // Source of the connection (optional)
-	Catalog            string            // Catalog (optional)
-	Schema             string            // Schema (optional)
-	SessionProperties  map[string]string // Session properties (optional)
-	ExtraCredentials   map[string]string // Extra credentials (optional)
-	CustomClientName   string            // Custom client name (optional)
-	KerberosEnabled    string            // KerberosEnabled (optional, default is false)
-	KerberosKeytabPath string            // Kerberos Keytab Path (optional)
-	KerberosPrincipal  string            // Kerberos Principal used to authenticate to KDC (optional)
-	KerberosRealm      string            // The Kerberos Realm (optional)
-	KerberosConfigPath string            // The krb5 config path (optional)
-	SSLCertPath        string            // The SSL cert path for TLS verification (optional)
-	SSLCert            string            // The SSL cert for TLS verification (optional)
+	ServerURI                  string            // URI of the Trino server, e.g. http://user@localhost:8080
+	Source                     string            // Source of the connection (optional)
+	Catalog                    string            // Catalog (optional)
+	Schema                     string            // Schema (optional)
+	SessionProperties          map[string]string // Session properties (optional)
+	ExtraCredentials           map[string]string // Extra credentials (optional)
+	CustomClientName           string            // Custom client name (optional)
+	KerberosEnabled            string            // KerberosEnabled (optional, default is false)
+	KerberosKeytabPath         string            // Kerberos Keytab Path (optional)
+	KerberosPrincipal          string            // Kerberos Principal used to authenticate to KDC (optional)
+	KerberosRemoteServiceName  string            // Trino coordinator Kerberos service name (optional)
+	KerberosRealm              string            // The Kerberos Realm (optional)
+	KerberosConfigPath         string            // The krb5 config path (optional)
+	SSLCertPath                string            // The SSL cert path for TLS verification (optional)
+	SSLCert                    string            // The SSL cert for TLS verification (optional)
+	AccessToken                string            // An access token (JWT) for authentication (optional)
+	ForwardAuthorizationHeader bool              // Allow forwarding the `accessToken` named query parameter in the authorization header, overwriting the `AccessToken` option, if set (optional)
+	QueryTimeout               *time.Duration    // Configurable timeout for query (optional)
 }
 
 // FormatDSN returns a DSN string from the configuration.
@@ -184,13 +205,13 @@ func (c *Config) FormatDSN() (string, error) {
 	var sessionkv []string
 	if c.SessionProperties != nil {
 		for k, v := range c.SessionProperties {
-			sessionkv = append(sessionkv, k+"="+v)
+			sessionkv = append(sessionkv, k+mapKeySeparator+v)
 		}
 	}
 	var credkv []string
 	if c.ExtraCredentials != nil {
 		for k, v := range c.ExtraCredentials {
-			credkv = append(credkv, k+"="+v)
+			credkv = append(credkv, k+mapKeySeparator+v)
 		}
 	}
 	source := c.Source
@@ -199,6 +220,10 @@ func (c *Config) FormatDSN() (string, error) {
 	}
 	query := make(url.Values)
 	query.Add("source", source)
+
+	if c.ForwardAuthorizationHeader {
+		query.Add(forwardAuthorizationHeaderConfig, "true")
+	}
 
 	KerberosEnabled, _ := strconv.ParseBool(c.KerberosEnabled)
 	isSSL := serverURL.Scheme == "https"
@@ -215,7 +240,7 @@ func (c *Config) FormatDSN() (string, error) {
 		if c.SSLCert != "" {
 			return "", fmt.Errorf("trino: client configuration error, a custom SSL certificate file cannot be specified together with a certificate string")
 		}
-		query.Add(SSLCertPathConfig, c.SSLCertPath)
+		query.Add(sslCertPathConfig, c.SSLCertPath)
 	}
 
 	if c.SSLCert != "" {
@@ -225,30 +250,40 @@ func (c *Config) FormatDSN() (string, error) {
 		if c.SSLCertPath != "" {
 			return "", fmt.Errorf("trino: client configuration error, a custom SSL certificate string cannot be specified together with a certificate file")
 		}
-		query.Add(SSLCertConfig, c.SSLCert)
+		query.Add(sslCertConfig, c.SSLCert)
 	}
 
 	if KerberosEnabled {
-		query.Add(KerberosEnabledConfig, "true")
+		if !isSSL {
+			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled for secure env")
+		}
+		query.Add(kerberosEnabledConfig, "true")
 		query.Add(kerberosKeytabPathConfig, c.KerberosKeytabPath)
 		query.Add(kerberosPrincipalConfig, c.KerberosPrincipal)
 		query.Add(kerberosRealmConfig, c.KerberosRealm)
 		query.Add(kerberosConfigPathConfig, c.KerberosConfigPath)
-		if !isSSL {
-			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled for secure env")
+		remoteServiceName := c.KerberosRemoteServiceName
+		if remoteServiceName == "" {
+			remoteServiceName = "trino"
 		}
+		query.Add(kerberosRemoteServiceNameConfig, remoteServiceName)
 	}
 
 	// ensure consistent order of items
 	sort.Strings(sessionkv)
 	sort.Strings(credkv)
 
+	if c.QueryTimeout != nil {
+		query.Add("query_timeout", c.QueryTimeout.String())
+	}
+
 	for k, v := range map[string]string{
 		"catalog":            c.Catalog,
 		"schema":             c.Schema,
-		"session_properties": strings.Join(sessionkv, ","),
-		"extra_credentials":  strings.Join(credkv, ","),
+		"session_properties": strings.Join(sessionkv, mapEntrySeparator),
+		"extra_credentials":  strings.Join(credkv, mapEntrySeparator),
 		"custom_client":      c.CustomClientName,
+		accessTokenConfig:    c.AccessToken,
 	} {
 		if v != "" {
 			query[k] = []string{v}
@@ -260,14 +295,18 @@ func (c *Config) FormatDSN() (string, error) {
 
 // Conn is a Trino connection.
 type Conn struct {
-	baseURL               string
-	auth                  *url.Userinfo
-	httpClient            http.Client
-	httpHeaders           http.Header
-	kerberosClient        client.Client
-	kerberosEnabled       bool
-	progressUpdater       ProgressUpdater
-	progressUpdaterPeriod queryProgressCallbackPeriod
+	baseURL                    string
+	auth                       *url.Userinfo
+	httpClient                 http.Client
+	httpHeaders                http.Header
+	kerberosEnabled            bool
+	kerberosClient             *client.Client
+	kerberosRemoteServiceName  string
+	progressUpdater            ProgressUpdater
+	progressUpdaterPeriod      queryProgressCallbackPeriod
+	useExplicitPrepare         bool
+	forwardAuthorizationHeader bool
+	queryTimeout               *time.Duration
 }
 
 var (
@@ -283,24 +322,28 @@ func newConn(dsn string) (*Conn, error) {
 
 	query := serverURL.Query()
 
-	kerberosEnabled, _ := strconv.ParseBool(query.Get(KerberosEnabledConfig))
+	kerberosEnabled, _ := strconv.ParseBool(query.Get(kerberosEnabledConfig))
 
-	var kerberosClient client.Client
+	forwardAuthorizationHeader, _ := strconv.ParseBool(query.Get(forwardAuthorizationHeaderConfig))
+
+	useExplicitPrepare := true
+	if query.Get(explicitPrepareConfig) != "" {
+		useExplicitPrepare, _ = strconv.ParseBool(query.Get(explicitPrepareConfig))
+	}
+
+	var kerberosClient *client.Client
 
 	if kerberosEnabled {
 		kt, err := keytab.Load(query.Get(kerberosKeytabPathConfig))
 		if err != nil {
 			return nil, fmt.Errorf("trino: Error loading Keytab: %w", err)
 		}
-
-		kerberosClient = client.NewClientWithKeytab(query.Get(kerberosPrincipalConfig), query.Get(kerberosRealmConfig), kt)
 		conf, err := config.Load(query.Get(kerberosConfigPathConfig))
 		if err != nil {
 			return nil, fmt.Errorf("trino: Error loading krb config: %w", err)
 		}
 
-		kerberosClient.WithConfig(conf)
-
+		kerberosClient = client.NewWithKeytab(query.Get(kerberosPrincipalConfig), query.Get(kerberosRealmConfig), kt, conf)
 		loginErr := kerberosClient.Login()
 		if loginErr != nil {
 			return nil, fmt.Errorf("trino: Error login to KDC: %v", loginErr)
@@ -315,10 +358,10 @@ func newConn(dsn string) (*Conn, error) {
 		}
 	} else if serverURL.Scheme == "https" {
 
-		cert := []byte(query.Get(SSLCertConfig))
+		cert := []byte(query.Get(sslCertConfig))
 
-		if certPath := query.Get(SSLCertPathConfig); certPath != "" {
-			cert, err = ioutil.ReadFile(certPath)
+		if certPath := query.Get(sslCertPathConfig); certPath != "" {
+			cert, err = os.ReadFile(certPath)
 			if err != nil {
 				return nil, fmt.Errorf("trino: Error loading SSL Cert File: %w", err)
 			}
@@ -338,12 +381,25 @@ func newConn(dsn string) (*Conn, error) {
 		}
 	}
 
+	var queryTimeout *time.Duration
+	if timeoutStr := query.Get("query_timeout"); timeoutStr != "" {
+		d, err := time.ParseDuration(timeoutStr)
+		if err != nil {
+			return nil, fmt.Errorf("trino: invalid timeout: %w", err)
+		}
+		queryTimeout = &d
+	}
+
 	c := &Conn{
-		baseURL:         serverURL.Scheme + "://" + serverURL.Host,
-		httpClient:      *httpClient,
-		httpHeaders:     make(http.Header),
-		kerberosClient:  kerberosClient,
-		kerberosEnabled: kerberosEnabled,
+		baseURL:                    serverURL.Scheme + "://" + serverURL.Host,
+		httpClient:                 *httpClient,
+		httpHeaders:                make(http.Header),
+		kerberosClient:             kerberosClient,
+		kerberosEnabled:            kerberosEnabled,
+		kerberosRemoteServiceName:  query.Get(kerberosRemoteServiceNameConfig),
+		useExplicitPrepare:         useExplicitPrepare,
+		forwardAuthorizationHeader: forwardAuthorizationHeader,
+		queryTimeout:               queryTimeout,
 	}
 
 	var user string
@@ -356,19 +412,73 @@ func newConn(dsn string) (*Conn, error) {
 	}
 
 	for k, v := range map[string]string{
-		trinoUserHeader:            user,
-		trinoSourceHeader:          query.Get("source"),
-		trinoCatalogHeader:         query.Get("catalog"),
-		trinoSchemaHeader:          query.Get("schema"),
-		trinoSessionHeader:         query.Get("session_properties"),
-		trinoExtraCredentialHeader: query.Get("extra_credentials"),
+		trinoUserHeader:     user,
+		trinoSourceHeader:   query.Get("source"),
+		trinoCatalogHeader:  query.Get("catalog"),
+		trinoSchemaHeader:   query.Get("schema"),
+		authorizationHeader: getAuthorization(query.Get(accessTokenConfig)),
 	} {
 		if v != "" {
 			c.httpHeaders.Add(k, v)
 		}
 	}
+	for header, param := range map[string]string{
+		trinoSessionHeader:         "session_properties",
+		trinoExtraCredentialHeader: "extra_credentials",
+	} {
+		v := query.Get(param)
+		if v != "" {
+			c.httpHeaders[header], err = decodeMapHeader(param, v)
+			if err != nil {
+				return c, err
+			}
+		}
+	}
 
 	return c, nil
+}
+
+func decodeMapHeader(name, input string) ([]string, error) {
+	result := []string{}
+	for _, entry := range strings.Split(input, mapEntrySeparator) {
+		parts := strings.SplitN(entry, mapKeySeparator, 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("trino: Malformed %s: %s", name, input)
+		}
+		key := parts[0]
+		value := parts[1]
+		if len(key) == 0 {
+			return nil, fmt.Errorf("trino: %s key is empty", name)
+		}
+		if len(value) == 0 {
+			return nil, fmt.Errorf("trino: %s value is empty", name)
+		}
+		if !isASCII(key) {
+			return nil, fmt.Errorf("trino: %s key '%s' contains spaces or is not printable ASCII", name, key)
+		}
+		if !isASCII(value) {
+			// do not log value as it may contain sensitive information
+			return nil, fmt.Errorf("trino: %s value for key '%s' contains spaces or is not printable ASCII", name, key)
+		}
+		result = append(result, key+"="+url.QueryEscape(value))
+	}
+	return result, nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '\u0021' || s[i] > '\u007E' {
+			return false
+		}
+	}
+	return true
+}
+
+func getAuthorization(token string) string {
+	if token == "" {
+		return ""
+	}
+	return fmt.Sprintf("Bearer %s", token)
 }
 
 // registry for custom http clients
@@ -448,14 +558,18 @@ func (c *Conn) Close() error {
 	return nil
 }
 
-func (c *Conn) newRequest(method, url string, body io.Reader, hs http.Header) (*http.Request, error) {
-	req, err := http.NewRequest(method, url, body)
+func (c *Conn) newRequest(ctx context.Context, method, url string, body io.Reader, hs http.Header) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("trino: %w", err)
 	}
 
 	if c.kerberosEnabled {
-		err = c.kerberosClient.SetSPNEGOHeader(req, "trino/"+req.URL.Hostname())
+		remoteServiceName := "trino"
+		if c.kerberosRemoteServiceName != "" {
+			remoteServiceName = c.kerberosRemoteServiceName
+		}
+		err = spnego.SetSPNEGOHeader(c.kerberosClient, req, remoteServiceName+"/"+req.URL.Hostname())
 		if err != nil {
 			return nil, fmt.Errorf("error setting client SPNEGO header: %w", err)
 		}
@@ -485,14 +599,7 @@ func (c *Conn) roundTrip(ctx context.Context, req *http.Request) (*http.Response
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-timer.C:
-			timeout := DefaultQueryTimeout
-			if deadline, ok := ctx.Deadline(); ok {
-				timeout = time.Until(deadline)
-			}
-			client := c.httpClient
-			client.Timeout = timeout
-			req.Cancel = ctx.Done()
-			resp, err := client.Do(req)
+			resp, err := c.httpClient.Do(req)
 			if err != nil {
 				return nil, &ErrQueryFailed{Reason: err}
 			}
@@ -533,7 +640,7 @@ func (c *Conn) roundTrip(ctx context.Context, req *http.Request) (*http.Response
 					}
 				}
 				return resp, nil
-			case http.StatusServiceUnavailable:
+			case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 				resp.Body.Close()
 				timer.Reset(delay)
 				delay = time.Duration(math.Min(
@@ -560,11 +667,16 @@ func (e *ErrQueryFailed) Error() string {
 		e.StatusCode, http.StatusText(e.StatusCode), e.Reason)
 }
 
+// Unwrap implements the unwrap interface.
+func (e *ErrQueryFailed) Unwrap() error {
+	return e.Reason
+}
+
 func newErrQueryFailedFromResponse(resp *http.Response) *ErrQueryFailed {
 	const maxBytes = 8 * 1024
 	defer resp.Body.Close()
 	qf := &ErrQueryFailed{StatusCode: resp.StatusCode}
-	b, err := ioutil.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 	if err != nil {
 		qf.Reason = err
 		return qf
@@ -656,7 +768,9 @@ func (st *driverStmt) ExecContext(ctx context.Context, args []driver.NamedValue)
 
 func (st *driverStmt) CheckNamedValue(arg *driver.NamedValue) error {
 	switch arg.Value.(type) {
-	case Numeric, trinoDate, trinoTime, trinoTimeTz, trinoTimestamp:
+	case nil:
+		return nil
+	case Numeric, trinoDate, trinoTime, trinoTimeTz, trinoTimestamp, time.Duration:
 		return nil
 	default:
 		{
@@ -681,49 +795,72 @@ type stmtResponse struct {
 	InfoURI     string    `json:"infoUri"`
 	NextURI     string    `json:"nextUri"`
 	Stats       stmtStats `json:"stats"`
-	Error       stmtError `json:"error"`
+	Error       ErrTrino  `json:"error"`
 	UpdateType  string    `json:"updateType"`
 	UpdateCount int64     `json:"updateCount"`
 }
 
 type stmtStats struct {
-	State              string    `json:"state"`
-	Scheduled          bool      `json:"scheduled"`
-	Nodes              int       `json:"nodes"`
-	TotalSplits        int       `json:"totalSplits"`
-	QueuesSplits       int       `json:"queuedSplits"`
-	RunningSplits      int       `json:"runningSplits"`
-	CompletedSplits    int       `json:"completedSplits"`
-	UserTimeMillis     int       `json:"userTimeMillis"`
-	CPUTimeMillis      int       `json:"cpuTimeMillis"`
-	WallTimeMillis     int       `json:"wallTimeMillis"`
-	ProcessedRows      int       `json:"processedRows"`
-	ProcessedBytes     int       `json:"processedBytes"`
-	RootStage          stmtStage `json:"rootStage"`
-	ProgressPercentage float32   `json:"progressPercentage"`
+	State                string      `json:"state"`
+	Scheduled            bool        `json:"scheduled"`
+	Nodes                int         `json:"nodes"`
+	TotalSplits          int         `json:"totalSplits"`
+	QueuesSplits         int         `json:"queuedSplits"`
+	RunningSplits        int         `json:"runningSplits"`
+	CompletedSplits      int         `json:"completedSplits"`
+	UserTimeMillis       int         `json:"userTimeMillis"`
+	CPUTimeMillis        int64       `json:"cpuTimeMillis"`
+	WallTimeMillis       int64       `json:"wallTimeMillis"`
+	QueuedTimeMillis     int64       `json:"queuedTimeMillis"`
+	ElapsedTimeMillis    int64       `json:"elapsedTimeMillis"`
+	ProcessedRows        int64       `json:"processedRows"`
+	ProcessedBytes       int64       `json:"processedBytes"`
+	PhysicalInputBytes   int64       `json:"physicalInputBytes"`
+	PhysicalWrittenBytes int64       `json:"physicalWrittenBytes"`
+	PeakMemoryBytes      int64       `json:"peakMemoryBytes"`
+	SpilledBytes         int64       `json:"spilledBytes"`
+	RootStage            stmtStage   `json:"rootStage"`
+	ProgressPercentage   jsonFloat64 `json:"progressPercentage"`
+	RunningPercentage    jsonFloat64 `json:"runningPercentage"`
 }
 
-type stmtError struct {
-	Message       string               `json:"message"`
-	ErrorName     string               `json:"errorName"`
-	ErrorCode     int                  `json:"errorCode"`
-	ErrorLocation stmtErrorLocation    `json:"errorLocation"`
-	FailureInfo   stmtErrorFailureInfo `json:"failureInfo"`
-	// Other fields omitted
+type ErrTrino struct {
+	Message       string        `json:"message"`
+	SqlState      string        `json:"sqlState"`
+	ErrorCode     int           `json:"errorCode"`
+	ErrorName     string        `json:"errorName"`
+	ErrorType     string        `json:"errorType"`
+	ErrorLocation ErrorLocation `json:"errorLocation"`
+	FailureInfo   FailureInfo   `json:"failureInfo"`
 }
 
-type stmtErrorLocation struct {
+func (i ErrTrino) Error() string {
+	return i.ErrorType + ": " + i.Message
+}
+
+type ErrorLocation struct {
 	LineNumber   int `json:"lineNumber"`
 	ColumnNumber int `json:"columnNumber"`
 }
 
-type stmtErrorFailureInfo struct {
-	Type string `json:"type"`
-	// Other fields omitted
+type FailureInfo struct {
+	Type          string        `json:"type"`
+	Message       string        `json:"message"`
+	Cause         *FailureInfo  `json:"cause"`
+	Suppressed    []FailureInfo `json:"suppressed"`
+	Stack         []string      `json:"stack"`
+	ErrorInfo     ErrorInfo     `json:"errorInfo"`
+	ErrorLocation ErrorLocation `json:"errorLocation"`
 }
 
-func (e stmtError) Error() string {
-	return e.FailureInfo.Type + ": " + e.Message
+type ErrorInfo struct {
+	Code int    `json:"code"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+func (i ErrorInfo) Error() string {
+	return fmt.Sprintf("%s: %s (%d)", i.Type, i.Name, i.Code)
 }
 
 type stmtStage struct {
@@ -742,6 +879,28 @@ type stmtStage struct {
 	ProcessedBytes  int         `json:"processedBytes"`
 	SubStages       []stmtStage `json:"subStages"`
 }
+
+type jsonFloat64 float64
+
+func (f *jsonFloat64) UnmarshalJSON(data []byte) error {
+	var v float64
+	err := json.Unmarshal(data, &v)
+	if err != nil {
+		var jsonErr *json.UnmarshalTypeError
+		if errors.As(err, &jsonErr) {
+			if f != nil {
+				*f = 0
+			}
+			return nil
+		}
+		return err
+	}
+	p := (*float64)(f)
+	*p = v
+	return nil
+}
+
+var _ json.Unmarshaler = new(jsonFloat64)
 
 func (st *driverStmt) Query(args []driver.Value) (driver.Rows, error) {
 	return nil, driver.ErrSkip
@@ -784,6 +943,17 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 				continue
 			}
 
+			if st.conn.forwardAuthorizationHeader && arg.Name == accessTokenConfig {
+				token := arg.Value.(string)
+				hs.Add(authorizationHeader, getAuthorization(token))
+				continue
+			}
+
+			if arg.Name == trinoEncoding {
+				hs.Add(trinoQueryDataEncodingHeader, arg.Value.(string))
+				continue
+			}
+
 			s, err := Serial(arg.Value)
 			if err != nil {
 				return nil, err
@@ -798,7 +968,7 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 
 				hs.Add(arg.Name, headerValue)
 			} else {
-				if hs.Get(preparedStatementHeader) == "" {
+				if st.conn.useExplicitPrepare && hs.Get(preparedStatementHeader) == "" {
 					for _, v := range st.conn.httpHeaders.Values(preparedStatementHeader) {
 						hs.Add(preparedStatementHeader, v)
 					}
@@ -811,17 +981,30 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 			return nil, ErrInvalidProgressCallbackHeader
 		}
 		if len(ss) > 0 {
-			query = "EXECUTE " + preparedStatementName + " USING " + strings.Join(ss, ", ")
+			if st.conn.useExplicitPrepare {
+				query = "EXECUTE " + preparedStatementName + " USING " + strings.Join(ss, ", ")
+			} else {
+				query = "EXECUTE IMMEDIATE " + formatStringLiteral(st.query) + " USING " + strings.Join(ss, ", ")
+			}
 		}
 	}
 
-	req, err := st.conn.newRequest("POST", st.conn.baseURL+"/v1/statement", strings.NewReader(query), hs)
+	var cancel context.CancelFunc = func() {}
+	if st.conn.queryTimeout != nil {
+		ctx, cancel = context.WithTimeout(ctx, *st.conn.queryTimeout)
+	} else if _, ok := ctx.Deadline(); !ok {
+		ctx, cancel = context.WithTimeout(ctx, DefaultQueryTimeout)
+	}
+
+	req, err := st.conn.newRequest(ctx, "POST", st.conn.baseURL+"/v1/statement", strings.NewReader(query), hs)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	resp, err := st.conn.roundTrip(ctx, req)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
@@ -831,6 +1014,7 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 	d.UseNumber()
 	err = d.Decode(&sr)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("trino: %w", err)
 	}
 
@@ -849,8 +1033,12 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 				}
 				hs := make(http.Header)
 				hs.Add(trinoUserHeader, st.user)
-				req, err := st.conn.newRequest("GET", nextURI, nil, hs)
+				req, err := st.conn.newRequest(ctx, "GET", nextURI, nil, hs)
 				if err != nil {
+					if ctx.Err() == context.Canceled {
+						st.errors <- context.Canceled
+						return
+					}
 					st.errors <- err
 					return
 				}
@@ -875,6 +1063,7 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 	}()
 	go func() {
 		defer close(st.queryResponses)
+		defer cancel()
 		for {
 			select {
 			case resp := <-st.httpResponses:
@@ -947,6 +1136,10 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 	return &sr, handleResponseError(resp.StatusCode, sr.Error)
 }
 
+func formatStringLiteral(query string) string {
+	return "'" + strings.ReplaceAll(query, "'", "''") + "'"
+}
+
 type driverRows struct {
 	ctx     context.Context
 	stmt    *driverStmt
@@ -981,12 +1174,12 @@ func (qr *driverRows) Close() error {
 	if qr.stmt.user != "" {
 		hs.Add(trinoUserHeader, qr.stmt.user)
 	}
-	req, err := qr.stmt.conn.newRequest("DELETE", qr.stmt.conn.baseURL+"/v1/query/"+url.PathEscape(qr.queryID), nil, hs)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(qr.ctx), DefaultCancelQueryTimeout)
+	defer cancel()
+	req, err := qr.stmt.conn.newRequest(ctx, "DELETE", qr.stmt.conn.baseURL+"/v1/query/"+url.PathEscape(qr.queryID), nil, hs)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultCancelQueryTimeout)
-	defer cancel()
 	resp, err := qr.stmt.conn.roundTrip(ctx, req)
 	if err != nil {
 		qferr, ok := err.(*ErrQueryFailed)
@@ -1090,11 +1283,306 @@ type queryResponse struct {
 	PartialCancelURI string        `json:"partialCancelUri"`
 	NextURI          string        `json:"nextUri"`
 	Columns          []queryColumn `json:"columns"`
-	Data             []queryData   `json:"data"`
+	Data             interface{}   `json:"data"`
 	Stats            stmtStats     `json:"stats"`
-	Error            stmtError     `json:"error"`
+	Error            ErrTrino      `json:"error"`
 	UpdateType       string        `json:"updateType"`
 	UpdateCount      int64         `json:"updateCount"`
+}
+
+type spoolingProtocol struct {
+	httpClient http.Client
+	ctx        context.Context
+	encoding   string
+	segments   []interface{}
+}
+
+type spoolingMetadata struct {
+	rowOffset        int64
+	rowsCount        int64
+	segmentSize      int64
+	uncompressedSize int64
+}
+
+func (sp *spoolingProtocol) fetch() ([]queryData, error) {
+	var queryData []queryData
+	for segmentIndex, segment := range sp.segments {
+		segment, ok := segment.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("segment at index %d is invalid: expected map[string]interface{}, got %T", segmentIndex, segment)
+		}
+		segmentMetadata, exists := segment["metadata"]
+		if !exists {
+			return nil, fmt.Errorf("metadata is missing in segment at index %d", segmentIndex)
+		}
+
+		typedMetadata, ok := segmentMetadata.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("metadata is invalid or cannot be parsed as map[string]interface{} in segment at index %d", segmentIndex)
+		}
+
+		metadata, err := parseSpoolingMetadata(typedMetadata)
+		if err != nil {
+			return nil, err
+		}
+		switch segment["type"] {
+		case "inline":
+			decodedBytes, err := base64.StdEncoding.DecodeString(segment["data"].(string))
+
+			if err != nil {
+				return nil, fmt.Errorf("error decoding base64 data in inline segment at index %d: %v", segmentIndex, err)
+			}
+
+			decodedData, err := decodeSegment(decodedBytes, sp.encoding, metadata)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode inline segment at index %d: %v", segmentIndex, err)
+			}
+
+			queryData = append(queryData, decodedData...)
+		case "spooled":
+			uri, ok := segment["uri"].(string)
+			if !ok || uri == "" {
+				return nil, fmt.Errorf("missing or invalid 'uri' field in spooled segment at index %d", segmentIndex)
+			}
+			ackUri, ok := segment["ackUri"].(string)
+			if !ok || ackUri == "" {
+				return nil, fmt.Errorf("missing or invalid 'ackUri' field in spooled segment at index %d", segmentIndex)
+			}
+			headers, ok := segment["headers"].(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("missing or invalid 'headers' field in spooled segment at index %d", segmentIndex)
+			}
+
+			data, err := sp.fetchSegment(uri, ackUri, headers)
+			if err != nil {
+				return nil, fmt.Errorf("failed to fetch segment from uri '%s' at index %d: %v", uri, segmentIndex, err)
+			}
+
+			decodedData, err := decodeSegment(data, sp.encoding, metadata)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode spooled segment at index %d: %v", segmentIndex, err)
+			}
+
+			queryData = append(queryData, decodedData...)
+		}
+
+	}
+
+	return queryData, nil
+}
+
+func parseSpoolingMetadata(metadata map[string]interface{}) (spoolingMetadata, error) {
+	result := spoolingMetadata{
+		rowOffset:        0,
+		rowsCount:        0,
+		segmentSize:      0,
+		uncompressedSize: 0,
+	}
+
+	var err error
+	// Mandatory field
+	if result.rowOffset, err = getInt64(metadata, "rowOffset"); err != nil {
+		return spoolingMetadata{}, err
+	}
+
+	// Mandatory field
+	if result.segmentSize, err = getInt64(metadata, "segmentSize"); err != nil {
+		return spoolingMetadata{}, err
+	}
+
+	if result.uncompressedSize, err = getOptionalInt64(metadata, "uncompressedSize"); err != nil {
+		return spoolingMetadata{}, err
+	}
+
+	// Bug: rowsCount was wrongly not enforced as a mandatory field on Trino response. Fixed on 475 release
+	if result.rowsCount, err = getOptionalInt64(metadata, "rowsCount"); err != nil {
+		return spoolingMetadata{}, err
+	}
+
+	return result, nil
+}
+
+func getInt64(metadata map[string]interface{}, key string) (int64, error) {
+	val, exists := metadata[key]
+	if !exists {
+		return 0, fmt.Errorf("%s is missing in segment metadata", key)
+	}
+
+	return parseInt64(val, key)
+}
+
+func getOptionalInt64(metadata map[string]interface{}, key string) (int64, error) {
+	val, exists := metadata[key]
+	if !exists {
+		return 0, nil
+	}
+
+	return parseInt64(val, key)
+}
+
+func parseInt64(val interface{}, key string) (int64, error) {
+	num, ok := val.(json.Number)
+	if !ok {
+		return 0, fmt.Errorf("invalid type for %s in segment metadata, expected json.Number, got %T", key, val)
+	}
+
+	n, err := num.Int64()
+	if err != nil {
+		return 0, fmt.Errorf("error converting %s to int64: %v", key, err)
+	}
+
+	return n, nil
+}
+
+func (sp *spoolingProtocol) fetchSegment(uri, ackUri string, headers map[string]interface{}) ([]byte, error) {
+	req, err := http.NewRequestWithContext(sp.ctx, "GET", uri, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	for k, v := range headers {
+		headerSlice, ok := v.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("unsupported header type %T", v)
+		}
+
+		if len(headerSlice) == 0 {
+			continue
+		}
+
+		if len(headerSlice) > 1 {
+			return nil, fmt.Errorf("multiple values for header %s", k)
+		}
+
+		header, ok := headerSlice[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("unsupported header value type %T", headerSlice[0])
+		}
+		req.Header.Add(k, header)
+	}
+
+	resp, err := sp.roundTrip(req)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching segment from uri '%s': %v", uri, err)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response body: %v", err)
+	}
+
+	//acknowledge the segment read
+	go func() {
+		// TODO: handle ack erros
+		ackReq, err := http.NewRequestWithContext(sp.ctx, "GET", ackUri, nil)
+		if err != nil {
+			return
+		}
+
+		for k, values := range req.Header {
+			for _, v := range values {
+				ackReq.Header.Add(k, v)
+			}
+		}
+
+		resp, err := sp.httpClient.Do(ackReq)
+		if err != nil {
+			return
+		}
+		resp.Body.Close()
+	}()
+
+	return data, nil
+}
+
+func (sp *spoolingProtocol) roundTrip(req *http.Request) (*http.Response, error) {
+	delay := 100 * time.Millisecond
+	const maxDelayBetweenRequests = float64(15 * time.Second)
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-sp.ctx.Done():
+			return nil, sp.ctx.Err()
+		case <-timer.C:
+			resp, err := sp.httpClient.Do(req)
+			if err != nil {
+				return nil, &ErrQueryFailed{Reason: err}
+			}
+			switch resp.StatusCode {
+			case http.StatusOK:
+				return resp, nil
+			case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+				resp.Body.Close()
+				timer.Reset(delay)
+				delay = time.Duration(math.Min(
+					float64(delay)*math.Phi,
+					maxDelayBetweenRequests,
+				))
+				continue
+			default:
+				return nil, newErrQueryFailedFromResponse(resp)
+			}
+		}
+	}
+}
+
+func decodeSegment(data []byte, encoding string, metadata spoolingMetadata) ([]queryData, error) {
+	if int64(len(data)) != metadata.segmentSize {
+		return nil, fmt.Errorf("segment size mismatch: expected %d bytes, got %d bytes", metadata.segmentSize, len(data))
+	}
+
+	decompressedSegment, err := decompressSegment(data, encoding, metadata)
+	if err != nil {
+		return nil, err
+	}
+
+	var queryDataList = make([]queryData, metadata.rowsCount)
+	decoder := json.NewDecoder(bytes.NewReader(decompressedSegment))
+	decoder.UseNumber()
+	err = decoder.Decode(&queryDataList)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode segment into JSON at rowOffset %d: %v", metadata.rowOffset, err)
+	}
+
+	return queryDataList, nil
+}
+
+func decompressSegment(data []byte, encoding string, metadata spoolingMetadata) ([]byte, error) {
+	if metadata.uncompressedSize == 0 {
+		return data, nil
+	}
+
+	var decompressedData []byte
+	switch encoding {
+	case "json+zstd":
+		zstdReader, err := zstd.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("error creating zstd reader: %w", err)
+		}
+		defer zstdReader.Close()
+		decompressedData, err = io.ReadAll(zstdReader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress zstd segment at rowOffset %d: %v", metadata.rowOffset, err)
+		}
+	case "json+lz4":
+		decompressedData = make([]byte, metadata.uncompressedSize)
+
+		n, err := lz4.UncompressBlock(data, decompressedData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress LZ4 segment at rowOffset %d: %v", metadata.rowOffset, err)
+		}
+
+		decompressedData = decompressedData[:n]
+	default:
+		return nil, fmt.Errorf("unsupported segment encoder: %s", encoding)
+	}
+
+	if int64(len(decompressedData)) != metadata.uncompressedSize {
+		return nil, fmt.Errorf("decompressed size mismatch: expected %d bytes, got %d bytes", metadata.uncompressedSize, len(decompressedData))
+	}
+
+	return decompressedData, nil
 }
 
 type queryColumn struct {
@@ -1140,7 +1628,7 @@ type typeArgument struct {
 	long int64
 }
 
-func handleResponseError(status int, respErr stmtError) error {
+func handleResponseError(status int, respErr ErrTrino) error {
 	switch respErr.ErrorName {
 	case "":
 		return nil
@@ -1163,12 +1651,51 @@ func (qr *driverRows) fetch() error {
 			if qresp.ID == "" {
 				return io.EOF
 			}
+
 			err = qr.initColumns(&qresp)
 			if err != nil {
 				return err
 			}
+
 			qr.rowindex = 0
-			qr.data = qresp.Data
+			switch data := qresp.Data.(type) {
+			case []interface{}:
+				// direct protocol
+				qr.data = make([]queryData, len(data))
+				for i, item := range data {
+					if row, ok := item.([]interface{}); ok {
+						qr.data[i] = row
+					} else {
+						return fmt.Errorf("unexpected data type for row at index %d: expected []interface{}, got %T", i, item)
+					}
+				}
+			case map[string]interface{}:
+				// spooling protocol
+				encoding, ok := data["encoding"].(string)
+				if !ok {
+					return fmt.Errorf("invalid or missing 'encoding' field on spooling protocol, expected string")
+				}
+
+				segments, ok := data["segments"].([]interface{})
+				if !ok {
+					return fmt.Errorf("invalid or missing 'segments' field on spooling protocol, expected []interface{}")
+				}
+
+				spoolingData := spoolingProtocol{
+					httpClient: qr.stmt.conn.httpClient,
+					ctx:        qr.ctx,
+					encoding:   encoding,
+					segments:   segments,
+				}
+
+				qr.data, err = spoolingData.fetch()
+				if err != nil {
+					return err
+				}
+
+			case nil:
+				qr.data = nil
+			}
 			qr.rowsAffected = qresp.UpdateCount
 			qr.scheduleProgressUpdate(qresp.ID, qresp.Stats)
 			if len(qr.data) != 0 {
@@ -1179,7 +1706,7 @@ func (qr *driverRows) fetch() error {
 				// Channel was closed, which means the statement
 				// or rows were closed.
 				err = io.EOF
-			} else if err == context.Canceled {
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				qr.Close()
 			}
 			qr.err = err
@@ -1349,8 +1876,10 @@ func getScanType(typeNames []string) (reflect.Type, error) {
 	switch typeNames[0] {
 	case "boolean":
 		v = sql.NullBool{}
-	case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "unknown":
+	case "json", "char", "varchar", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "unknown":
 		v = sql.NullString{}
+	case "varbinary":
+		v = []byte{}
 	case "tinyint", "smallint":
 		v = sql.NullInt32{}
 	case "integer":
@@ -1434,12 +1963,14 @@ func (c *typeConverter) ConvertValue(v interface{}) (driver.Value, error) {
 			return nil, err
 		}
 		return vv.Bool, err
-	case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "unknown":
+	case "json", "char", "varchar", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "Geometry", "SphericalGeography", "unknown":
 		vv, err := scanNullString(v)
 		if !vv.Valid {
 			return nil, err
 		}
 		return vv.String, err
+	case "varbinary":
+		return scanNullBytes(v)
 	case "tinyint", "smallint", "integer", "bigint":
 		vv, err := scanNullInt64(v)
 		if !vv.Valid {
@@ -1607,6 +2138,26 @@ func scanNullString(v interface{}) (sql.NullString, error) {
 			fmt.Errorf("cannot convert %v (%T) to string", v, v)
 	}
 	return sql.NullString{Valid: true, String: vv}, nil
+}
+
+func scanNullBytes(v interface{}) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+
+	// VARBINARY values come back as a base64 encoded string.
+	vv, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("cannot convert %v (%T) to []byte", v, v)
+	}
+
+	// Decode the base64 encoded string into a []byte.
+	decoded, err := base64.StdEncoding.DecodeString(vv)
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode base64 string into []byte: %w", err)
+	}
+
+	return decoded, nil
 }
 
 // NullSliceString represents a slice of string that may be null.
