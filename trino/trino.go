@@ -56,6 +56,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1535,8 +1536,31 @@ func (c *typeConverter) ConvertValue(v interface{}) (driver.Value, error) {
 		}
 		return v, nil
 	default:
-		return nil, fmt.Errorf("type not supported: %q", c.typeName)
+		// default to Base64
+		//https://github.com/trinodb/trino/blob/master/client/trino-client/src/main/java/io/trino/client/JsonDecodingUtils.java#L412
+		return scanNullBytes(v)
+
 	}
+}
+
+func scanNullBytes(v interface{}) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+
+	// VARBINARY values come back as a base64 encoded string.
+	vv, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("cannot convert %v (%T) to []byte", v, v)
+	}
+
+	// Decode the base64 encoded string into a []byte.
+	decoded, err := base64.StdEncoding.DecodeString(vv)
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode base64 string into []byte: %w", err)
+	}
+
+	return decoded, nil
 }
 
 func validateMap(v interface{}) error {
