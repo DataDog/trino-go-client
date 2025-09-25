@@ -1432,7 +1432,7 @@ func getScanType(typeNames []string) (reflect.Type, error) {
 	switch typeNames[0] {
 	case "boolean":
 		v = sql.NullBool{}
-	case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "unknown":
+	case "json", "pgjson", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "unknown":
 		v = sql.NullString{}
 	case "tinyint", "smallint":
 		v = sql.NullInt32{}
@@ -1444,7 +1444,7 @@ func getScanType(typeNames []string) (reflect.Type, error) {
 		v = sql.NullFloat64{}
 	case "date", "time", "time with time zone", "timestamp", "timestamp with time zone":
 		v = sql.NullTime{}
-	case "map":
+	case "map", "hstore", "hstore_csv":
 		v = NullMap{}
 	case "array":
 		if len(typeNames) <= 1 {
@@ -1517,7 +1517,7 @@ func (c *typeConverter) ConvertValue(v interface{}) (driver.Value, error) {
 			return nil, err
 		}
 		return vv.Bool, err
-	case "json", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "Geometry", "SphericalGeography", "unknown":
+	case "json", "pgjson", "char", "varchar", "varbinary", "interval year to month", "interval day to second", "decimal", "ipaddress", "uuid", "Geometry", "SphericalGeography", "unknown":
 		vv, err := scanNullString(v)
 		if !vv.Valid {
 			return nil, err
@@ -1541,7 +1541,7 @@ func (c *typeConverter) ConvertValue(v interface{}) (driver.Value, error) {
 			return nil, err
 		}
 		return vv.Time, err
-	case "map":
+	case "map", "hstore", "hstore_csv":
 		if err := validateMap(v); err != nil {
 			return nil, err
 		}
